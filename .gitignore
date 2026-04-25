@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Streamlit/local logs
+.streamlit/
+streamlit*.log
+
+# Generated simulation artifacts
+bankroll_simulation.xlsx
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
