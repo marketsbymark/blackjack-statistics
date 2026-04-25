@@ -12,6 +12,9 @@ env/
 .streamlit/
 streamlit*.log
 
+# Local assistant/tool config
+.claude/
+
 # Generated simulation artifacts
 bankroll_simulation.xlsx
 
