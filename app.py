@@ -5,7 +5,7 @@ import plotly.graph_objects as go
 import plotly.express as px
 
 # Import simulation logic from the existing script
-from bankroll_sim import validate_pmf, SimParams, simulate
+from bankroll_sim import MAX_ROUND_NET_UNITS, RULE_SET, SimParams, simulate
 
 # -----------------------------------------------------------------------------
 # Streamlit Page Config
@@ -22,11 +22,11 @@ st.set_page_config(
 # -----------------------------------------------------------------------------
 st.title("🎰 Blackjack Bankroll Monte Carlo Simulator")
 st.markdown("""
-Welcome to the interactive Blackjack Bankroll Simulator! Adjust the parameters in the sidebar to run a 
-Monte Carlo simulation estimating how long your bankroll will last under realistic casino rules.
+Welcome to the interactive Blackjack Bankroll Simulator! Adjust the parameters in the sidebar to run a
+card-level Monte Carlo simulation estimating how long your bankroll will last under realistic casino rules.
 
-**Rules Modeled:** 6-deck shoe, Dealer hits on soft 17 (H17), Double after split allowed (DAS), 
-Blackjack pays 3:2, perfect basic strategy, flat betting.
+**Rules Modeled:** 6-deck shoe, H17, DAS, blackjack pays 3:2, no surrender/insurance,
+basic strategy, flat betting, split to 4 hands, split aces receive one card only.
 """)
 
 # -----------------------------------------------------------------------------
@@ -38,16 +38,18 @@ with st.sidebar:
     bet = st.number_input("Dollars per hand", min_value=1.0, value=25.0, step=5.0)
     bankroll = st.number_input("Starting bankroll ($)", min_value=1.0, value=500.0, step=50.0)
     minutes_per_hand = st.number_input("Minutes per hand", min_value=0.1, value=0.75, step=0.1)
+    session_hours = st.number_input("Session length (hours)", min_value=0.25, value=4.0, step=0.25)
+    max_hands = max(1, int(round((session_hours * 60.0) / minutes_per_hand)))
+    st.caption(f"Simulating about {max_hands:,} hands per session.")
     
     st.divider()
     
     sims = st.selectbox(
-        "Number of simulations", 
-        options=[1000, 5000, 10000, 20000, 50000], 
-        index=3,
-        help="Higher numbers provide smoother curves but take longer to compute."
+        "Number of simulations",
+        options=[100, 500, 1000, 5000, 10000],
+        index=2,
+        help="The full card engine is much slower than the old PMF model; increase this for smoother curves."
     )
-    max_hands = st.number_input("Max hands per sim", min_value=1000, value=20000, step=1000)
     seed = st.number_input("Random seed", value=20260424)
     n_trajectories = st.slider(
         "Trajectories to plot", 
@@ -64,9 +66,6 @@ with st.sidebar:
 # -----------------------------------------------------------------------------
 if run_sim or "result" not in st.session_state:
     with st.spinner("Rolling the dice (running simulation)..."):
-        # Validate PMF and get expected values
-        ev, sd = validate_pmf()
-        
         # Build parameters
         params = SimParams(
             bet=float(bet),
@@ -79,21 +78,19 @@ if run_sim or "result" not in st.session_state:
         )
         
         # Run core logic
-        result = simulate(params, ev, sd)
+        result = simulate(params)
         
         # Cache results in session state so changing tabs/interacting doesn't re-run
         st.session_state["result"] = result
         st.session_state["params"] = params
-        st.session_state["ev"] = ev
-        st.session_state["sd"] = sd
 
 # -----------------------------------------------------------------------------
 # Extract Cache for Rendering
 # -----------------------------------------------------------------------------
 result = st.session_state["result"]
 params = st.session_state["params"]
-ev = st.session_state["ev"]
-sd = st.session_state["sd"]
+ev = result.ev_units
+sd = result.sd_units
 
 # Calculate top-level stats
 ruin_rate = float(result.ruined.mean())
@@ -102,6 +99,8 @@ hands_per_hour = 60.0 / params.minutes_per_hand
 ev_dollar_loss_per_hour = dollar_loss_per_hand * hands_per_hour
 survivors = result.ending_bankroll[~result.ruined]
 mean_survivor_bankroll = float(np.mean(survivors)) if survivors.size else 0.0
+mean_ending_bankroll = float(np.mean(result.ending_bankroll))
+mean_net_result = mean_ending_bankroll - params.bankroll
 
 # -----------------------------------------------------------------------------
 # Dashboard Top Row: Key Metrics
@@ -126,10 +125,93 @@ col3.metric(
     help=f"At {hands_per_hour:.1f} hands/hour and ${params.bet}/hand."
 )
 col4.metric(
-    label="Mean Survivor Bankroll", 
-    value=f"${mean_survivor_bankroll:,.2f}",
-    help="Average bankroll for the players who did not hit ruin."
+    label="Mean Ending Bankroll",
+    value=f"${mean_ending_bankroll:,.2f}",
+    delta=f"${mean_net_result:,.2f} vs start",
+    delta_color="normal" if mean_net_result >= 0 else "inverse",
+    help="Average final bankroll across every simulation, including ruined players."
 )
+
+st.caption(f"Engine: {RULE_SET}. EV/SD are measured from {result.hands_played_total:,} simulated rounds.")
+
+surv_col1, surv_col2 = st.columns(2)
+surv_col1.metric(
+    label="Survivors",
+    value=f"{survivors.size:,} / {params.sims:,}",
+    help="Simulations that did not hit ruin before max hands."
+)
+surv_col2.metric(
+    label="Mean Survivor Bankroll",
+    value=f"${mean_survivor_bankroll:,.2f}",
+    help="Conditional average among survivors only. This is intentionally separated because it excludes ruined players."
+)
+
+col5, col6, col7, col8 = st.columns(4)
+col5.metric(
+    label="Rounds With Split",
+    value=f"{result.split_rate * 100:.2f}%",
+    help="Percent of initial rounds that included at least one split."
+)
+col6.metric(
+    label="Rounds With Double",
+    value=f"{result.double_rate * 100:.2f}%",
+    help="Percent of initial rounds that included at least one double down."
+)
+col7.metric(
+    label="Rounds With DAS",
+    value=f"{result.das_rate * 100:.2f}%",
+    help="Percent of initial rounds that included at least one double after split."
+)
+col8.metric(
+    label="Avg / Max Exposure",
+    value=f"{result.avg_exposure_units:.2f}x / {result.max_exposure_units:.0f}x",
+    help="Average and maximum base-bet exposure required during a round."
+)
+
+st.divider()
+
+event_fig = go.Figure(go.Bar(
+    x=["Split", "Double", "DAS", "Blackjack", "Push", "Player Bust", "Dealer Bust", ">1 Bet Risked"],
+    y=[
+        result.split_rate * 100,
+        result.double_rate * 100,
+        result.das_rate * 100,
+        result.blackjack_rate * 100,
+        result.push_rate * 100,
+        result.player_bust_rate * 100,
+        result.dealer_bust_rate * 100,
+        result.multi_bet_rate * 100,
+    ],
+    marker_color=["#00cc96", "#636efa", "#ab63fa", "#facc15", "#19d3f3", "#ef553b", "#ffa15a", "#b6e880"],
+))
+event_fig.update_layout(
+    title="Round Event Probabilities",
+    yaxis_title="Rounds with event (%)",
+    height=320,
+    margin=dict(l=0, r=0, t=40, b=0),
+    xaxis=dict(showgrid=False),
+    yaxis=dict(showgrid=True, gridcolor='rgba(255,255,255,0.1)')
+)
+st.plotly_chart(event_fig, use_container_width=True)
+
+action_fig = go.Figure(go.Bar(
+    x=["Split actions", "Double actions", "DAS actions"],
+    y=[
+        result.split_action_rate * 100,
+        result.double_action_rate * 100,
+        result.das_action_rate * 100,
+    ],
+    marker_color=["#00cc96", "#636efa", "#ab63fa"],
+))
+action_fig.update_layout(
+    title="Action Counts per Initial Round",
+    yaxis_title="Actions per 100 initial rounds",
+    height=280,
+    margin=dict(l=0, r=0, t=40, b=0),
+    xaxis=dict(showgrid=False),
+    yaxis=dict(showgrid=True, gridcolor='rgba(255,255,255,0.1)')
+)
+st.plotly_chart(action_fig, use_container_width=True)
 
 st.divider()
 
@@ -178,17 +260,17 @@ with col_chart1:
         showlegend=True
     ))
 
-    # Theoretical Best Case (+1 bet every hand)
-    best_case_y = params.bankroll + (x_axis * params.bet * 1.0)
+    # Theoretical extreme case: split to 4 hands, double all 4, win every doubled hand.
+    best_case_y = params.bankroll + (x_axis * params.bet * MAX_ROUND_NET_UNITS)
     fig_traj.add_trace(go.Scatter(
         x=x_axis, y=best_case_y, mode='lines', 
         line=dict(color='gold', width=2, dash='dash'), 
-        name='Theoretical Best (+1 win/hand)',
+        name=f'Theoretical Max (+{MAX_ROUND_NET_UNITS:.0f} units/round)',
         showlegend=True
     ))
     
-    # Theoretical Worst Case (-1 bet every hand)
-    worst_case_y = params.bankroll + (x_axis * params.bet * -1.0)
+    # Theoretical extreme loss mirrors the max funded split/double exposure.
+    worst_case_y = params.bankroll + (x_axis * params.bet * -MAX_ROUND_NET_UNITS)
     ruin_indices = np.where(worst_case_y < params.bet)[0]
     if len(ruin_indices) > 0:
         worst_case_y[ruin_indices[0]:] = worst_case_y[ruin_indices[0]]
@@ -196,7 +278,7 @@ with col_chart1:
     fig_traj.add_trace(go.Scatter(
         x=x_axis, y=worst_case_y, mode='lines', 
         line=dict(color='red', width=2, dash='dash'), 
-        name='Theoretical Worst (-1 loss/hand)',
+        name=f'Theoretical Min (-{MAX_ROUND_NET_UNITS:.0f} units/round)',
         showlegend=True
     ))
     
@@ -212,15 +294,15 @@ with col_chart1:
 
 with col_chart2:
     st.subheader("📉 Time-to-Ruin Distribution")
-    st.markdown("Histogram showing how long it takes to go broke (for those who do).")
+    st.markdown("Histogram showing how many hands it takes to go broke (for those who do).")
     
-    ttl_hours = (result.ttl_hands[result.ruined] * params.minutes_per_hand) / 60.0
+    ttl_ruin_hands = result.ttl_hands[result.ruined]
     
-    if len(ttl_hours) > 0:
+    if len(ttl_ruin_hands) > 0:
         fig_hist = px.histogram(
-            x=ttl_hours, 
+            x=ttl_ruin_hands,
             nbins=50,
-            labels={'x': 'Hours to Ruin', 'y': 'Number of Players'},
+            labels={'x': 'Hands Until Ruin', 'y': 'Number of Players'},
             color_discrete_sequence=['#ef553b'] # Plotly Red
         )
         fig_hist.update_layout(
