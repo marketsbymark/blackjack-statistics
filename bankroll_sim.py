@@ -51,6 +51,7 @@ class SimParams:
     max_hands: int
     seed: int
     sims_per_batch: int = 2000
+    n_trajectories: int = 50
 
 
 @dataclass
@@ -76,7 +77,7 @@ def simulate(params: SimParams, ev: float, sd: float) -> SimResult:
     )
     survival_hits = np.zeros(n_checkpoints, dtype=np.int64)
 
-    n_samples = min(50, params.sims)
+    n_samples = min(params.n_trajectories, params.sims)
     sample_paths = np.empty((n_samples, params.max_hands + 1), dtype=np.float64)
     samples_filled = 0
 
@@ -99,8 +100,10 @@ def simulate(params: SimParams, ev: float, sd: float) -> SimResult:
         end_vals = traj[np.arange(b), end_idx]
 
         # Survival at checkpoint K: sim has NOT been ruined by hand K.
-        # first_below is 1-indexed ruin hand (== max_hands for survivors).
-        survival_hits += (first_below[:, None] > survival_hands[None, :]).sum(axis=0)
+        # first_below is 1-indexed ruin hand. For survivors, we pretend ruin is at max_hands + 1 
+        # so they pass the strictly-greater-than check for the final checkpoint.
+        survival_check = np.where(batch_ruined, first_below, params.max_hands + 1)
+        survival_hits += (survival_check[:, None] > survival_hands[None, :]).sum(axis=0)
 
         ttl_hands[done:done + b] = first_below
         ruined[done:done + b] = batch_ruined
@@ -113,7 +116,7 @@ def simulate(params: SimParams, ev: float, sd: float) -> SimResult:
             sample_paths[samples_filled:samples_filled + take, 1:] = traj[:take]
             for j in range(take):
                 fb = int(first_below[j])
-                if fb < params.max_hands:
+                if fb <= params.max_hands:
                     # Indices 1..max_hands correspond to hands 1..max_hands.
                     sample_paths[samples_filled + j, fb + 1:] = traj[j, fb - 1]
             samples_filled += take
