@@ -229,6 +229,12 @@ with col_chart1:
     fig_traj = go.Figure()
     
     x_axis = np.arange(result.sample_paths.shape[1])
+    observed_min = float(np.nanmin(result.sample_paths))
+    observed_max = float(np.nanmax(result.sample_paths))
+    y_span = max(observed_max - observed_min, params.bet * 4.0)
+    y_padding = max(params.bet * 2.0, y_span * 0.08)
+    y_min = min(observed_min, params.bet) - y_padding
+    y_max = observed_max + y_padding
     
     # Add each sample path
     for i in range(n_samples):
@@ -287,8 +293,21 @@ with col_chart1:
         yaxis_title="Bankroll ($)",
         height=400,
         margin=dict(l=0, r=0, t=10, b=0),
+        legend=dict(
+            x=0.02,
+            y=0.98,
+            xanchor="left",
+            yanchor="top",
+            bgcolor="rgba(0,0,0,0.35)",
+            bordercolor="rgba(255,255,255,0.15)",
+            borderwidth=1,
+        ),
         xaxis=dict(showgrid=True, gridcolor='rgba(255,255,255,0.1)'),
-        yaxis=dict(showgrid=True, gridcolor='rgba(255,255,255,0.1)')
+        yaxis=dict(
+            showgrid=True,
+            gridcolor='rgba(255,255,255,0.1)',
+            range=[y_min, y_max],
+        )
     )
     st.plotly_chart(fig_traj, use_container_width=True)
 
