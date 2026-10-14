@@ -5,7 +5,14 @@ import plotly.graph_objects as go
 import plotly.express as px
 
 # Import simulation logic from the existing script
-from bankroll_sim import MAX_ROUND_NET_UNITS, RULE_SET, SimParams, simulate
+from bankroll_sim import (
+    EV_LABEL,
+    RULE_SET,
+    SimParams,
+    ruin_by_hours,
+    simulate,
+    wilson_interval,
+)
 
 # -----------------------------------------------------------------------------
 # Streamlit Page Config
@@ -36,7 +43,13 @@ with st.sidebar:
     st.header("⚙️ Simulation Parameters")
     
     bet = st.number_input("Dollars per hand", min_value=1.0, value=25.0, step=5.0)
-    bankroll = st.number_input("Starting bankroll ($)", min_value=1.0, value=500.0, step=50.0)
+    bankroll = st.number_input(
+        "Starting bankroll ($)",
+        min_value=float(bet),
+        value=max(500.0, float(bet)),
+        step=50.0,
+        help="Must cover at least one bet.",
+    )
     minutes_per_hand = st.number_input("Minutes per hand", min_value=0.1, value=0.75, step=0.1)
     session_hours = st.number_input("Session length (hours)", min_value=0.25, value=4.0, step=0.25)
     max_hands = max(1, int(round((session_hours * 60.0) / minutes_per_hand)))
@@ -50,7 +63,7 @@ with st.sidebar:
         index=2,
         help="The full card engine is much slower than the old PMF model; increase this for smoother curves."
     )
-    seed = st.number_input("Random seed", value=20260424)
+    seed = st.number_input("Random seed", min_value=0, value=20260424, step=1, format="%d")
     n_trajectories = st.slider(
         "Trajectories to plot", 
         min_value=10, max_value=1000, value=100, step=10, 
@@ -64,19 +77,20 @@ with st.sidebar:
 # -----------------------------------------------------------------------------
 # Run Simulation
 # -----------------------------------------------------------------------------
+sidebar_params = SimParams(
+    bet=float(bet),
+    bankroll=float(bankroll),
+    minutes_per_hand=float(minutes_per_hand),
+    sims=int(sims),
+    max_hands=int(max_hands),
+    seed=int(seed),
+    n_trajectories=int(n_trajectories)
+)
+
 if run_sim or "result" not in st.session_state:
     with st.spinner("Rolling the dice (running simulation)..."):
-        # Build parameters
-        params = SimParams(
-            bet=float(bet),
-            bankroll=float(bankroll),
-            minutes_per_hand=float(minutes_per_hand),
-            sims=int(sims),
-            max_hands=int(max_hands),
-            seed=int(seed),
-            n_trajectories=int(n_trajectories)
-        )
-        
+        params = sidebar_params
+
         # Run core logic
         result = simulate(params)
         
@@ -92,8 +106,14 @@ params = st.session_state["params"]
 ev = result.ev_units
 sd = result.sd_units
 
+if params != sidebar_params:
+    st.warning("Sidebar inputs have changed. Results below are from the previous run; press **Run Simulation** to update.")
+
 # Calculate top-level stats
-ruin_rate = float(result.ruined.mean())
+ruin_k = int(result.ruined.sum())
+ruin_rate = ruin_k / params.sims
+ruin_lo, ruin_hi = wilson_interval(ruin_k, params.sims)
+ev_ci = 1.96 * result.ev_se_units
 dollar_loss_per_hand = -ev * params.bet
 hands_per_hour = 60.0 / params.minutes_per_hand
 ev_dollar_loss_per_hour = dollar_loss_per_hand * hands_per_hour
@@ -109,30 +129,38 @@ st.subheader("📊 Key Metrics")
 col1, col2, col3, col4 = st.columns(4)
 
 col1.metric(
-    label="Overall Ruin Probability", 
-    value=f"{ruin_rate * 100:.1f}%", 
-    help="Chance of losing the ability to make the minimum bet before reaching max hands."
+    label="Overall Ruin Probability",
+    value=f"{ruin_rate * 100:.1f}%",
+    help=(
+        f"Bankroll fell below one bet within the {params.max_hands:,}-hand session. "
+        f"95% Wilson CI: {ruin_lo * 100:.1f}% to {ruin_hi * 100:.1f}%."
+    ),
 )
 col2.metric(
-    label="House Edge", 
-    value=f"{-ev * 100:.2f}%",
-    delta=f"EV: {ev:.4f} units/hand",
-    delta_color="inverse"
+    label="Realized EV / Round",
+    value=f"{ev * 100:+.2f}% ± {ev_ci * 100:.2f}%",
+    help=(
+        f"{EV_LABEL}, per initial bet, with 95% CI (SE clustered by session). "
+        "Near ruin the player cannot fund every split/double, so this is not the "
+        "unconstrained house edge."
+    ),
 )
 col3.metric(
-    label="Expected Loss per Hour", 
+    label="Expected Loss per Hour",
     value=f"${ev_dollar_loss_per_hour:.2f}",
-    help=f"At {hands_per_hour:.1f} hands/hour and ${params.bet}/hand."
+    help=f"Realized EV × ${params.bet}/hand × {hands_per_hour:.1f} hands/hour.",
 )
 col4.metric(
     label="Mean Ending Bankroll",
     value=f"${mean_ending_bankroll:,.2f}",
-    delta=f"${mean_net_result:,.2f} vs start",
-    delta_color="normal" if mean_net_result >= 0 else "inverse",
-    help="Average final bankroll across every simulation, including ruined players."
+    delta=round(mean_net_result, 2),
+    help="Average final bankroll across every simulation, including ruined players. Delta is vs the starting bankroll."
 )
 
-st.caption(f"Engine: {RULE_SET}. EV/SD are measured from {result.hands_played_total:,} simulated rounds.")
+st.caption(
+    f"Engine: {RULE_SET}. EV/SD measured from {result.hands_played_total:,} simulated rounds. "
+    f"Ruin 95% CI: {ruin_lo * 100:.1f}%–{ruin_hi * 100:.1f}% ({params.sims:,} sessions)."
+)
 
 surv_col1, surv_col2 = st.columns(2)
 surv_col1.metric(
@@ -171,7 +199,7 @@ col8.metric(
 st.divider()
 
 event_fig = go.Figure(go.Bar(
-    x=["Split", "Double", "DAS", "Blackjack", "Push", "Player Bust", "Dealer Bust", ">1 Bet Risked"],
+    x=["Split", "Double", "DAS", "Blackjack", "Push", "Player Bust", "Dealer Bust*", ">1 Bet Risked"],
     y=[
         result.split_rate * 100,
         result.double_rate * 100,
@@ -193,6 +221,7 @@ event_fig.update_layout(
     yaxis=dict(showgrid=True, gridcolor='rgba(255,255,255,0.1)')
 )
 st.plotly_chart(event_fig, use_container_width=True)
+st.caption("*Dealer only draws when the player still has a live hand, so this understates the dealer's raw bust rate.")
 
 action_fig = go.Figure(go.Bar(
     x=["Split actions", "Double actions", "DAS actions"],
@@ -224,70 +253,60 @@ with col_chart1:
     n_samples = result.sample_paths.shape[0]
     
     st.subheader(f"📈 Sample Bankroll Trajectories ({n_samples} plotted)")
-    st.markdown("Visualizing a random subset of player bankrolls over time.")
-    
+    st.markdown(
+        "Paths of the first simulated sessions (sessions are independent, so this is an unbiased sample). "
+        "The median and 10–90% band are computed over **all** simulations."
+    )
+
     fig_traj = go.Figure()
-    
-    x_axis = np.arange(result.sample_paths.shape[1])
-    observed_min = float(np.nanmin(result.sample_paths))
-    observed_max = float(np.nanmax(result.sample_paths))
+
+    n_points = result.sample_paths.shape[1]
+    x_axis = np.arange(n_points)
+
+    # One trace with NaN separators renders far faster than one trace per path.
+    x_all = np.tile(np.append(x_axis, np.nan), n_samples)
+    y_all = np.hstack([result.sample_paths, np.full((n_samples, 1), np.nan)]).ravel()
+    fig_traj.add_trace(go.Scattergl(
+        x=x_all,
+        y=y_all,
+        mode='lines',
+        line=dict(width=1, color='rgba(0, 204, 150, 0.35)'),
+        name='Sample paths',
+        hoverinfo='skip',
+        connectgaps=False,
+    ))
+
+    band_x = result.survival_hands
+    fig_traj.add_trace(go.Scatter(
+        x=band_x, y=result.band_p90, mode='lines',
+        line=dict(width=0), showlegend=False, hoverinfo='skip',
+    ))
+    fig_traj.add_trace(go.Scatter(
+        x=band_x, y=result.band_p10, mode='lines',
+        line=dict(width=0), fill='tonexty', fillcolor='rgba(255,255,255,0.15)',
+        name='10–90% (all sims)',
+    ))
+    fig_traj.add_trace(go.Scatter(
+        x=band_x, y=result.band_p50, mode='lines',
+        line=dict(color='white', width=3),
+        name='Median (all sims)',
+    ))
+
+    fig_traj.add_hline(
+        y=params.bet,
+        line_dash="dash",
+        line_color="red",
+        annotation_text="Ruin Line",
+        annotation_position="bottom right"
+    )
+
+    observed_min = min(float(np.nanmin(result.sample_paths)), float(np.min(result.band_p10)))
+    observed_max = max(float(np.nanmax(result.sample_paths)), float(np.max(result.band_p90)))
     y_span = max(observed_max - observed_min, params.bet * 4.0)
     y_padding = max(params.bet * 2.0, y_span * 0.08)
     y_min = min(observed_min, params.bet) - y_padding
     y_max = observed_max + y_padding
-    
-    # Add each sample path
-    for i in range(n_samples):
-        y_vals = result.sample_paths[i]
-        fig_traj.add_trace(go.Scatter(
-            x=x_axis,
-            y=y_vals,
-            mode='lines',
-            line=dict(width=1, color='rgba(0, 204, 150, 0.4)'), # Plotly Teal/Green semi-transparent
-            showlegend=False,
-            hoverinfo='skip'
-        ))
-    
-    # Ruin threshold line
-    fig_traj.add_hline(
-        y=params.bet, 
-        line_dash="dash", 
-        line_color="red", 
-        annotation_text="Ruin Line",
-        annotation_position="bottom right"
-    )
-    
-    # 50th Percentile (Median)
-    p50_path = np.median(result.sample_paths, axis=0)
-    fig_traj.add_trace(go.Scatter(
-        x=x_axis, y=p50_path, mode='lines', 
-        line=dict(color='white', width=3), 
-        name='50th Percentile (Median)',
-        showlegend=True
-    ))
 
-    # Theoretical extreme case: split to 4 hands, double all 4, win every doubled hand.
-    best_case_y = params.bankroll + (x_axis * params.bet * MAX_ROUND_NET_UNITS)
-    fig_traj.add_trace(go.Scatter(
-        x=x_axis, y=best_case_y, mode='lines', 
-        line=dict(color='gold', width=2, dash='dash'), 
-        name=f'Theoretical Max (+{MAX_ROUND_NET_UNITS:.0f} units/round)',
-        showlegend=True
-    ))
-    
-    # Theoretical extreme loss mirrors the max funded split/double exposure.
-    worst_case_y = params.bankroll + (x_axis * params.bet * -MAX_ROUND_NET_UNITS)
-    ruin_indices = np.where(worst_case_y < params.bet)[0]
-    if len(ruin_indices) > 0:
-        worst_case_y[ruin_indices[0]:] = worst_case_y[ruin_indices[0]]
-        
-    fig_traj.add_trace(go.Scatter(
-        x=x_axis, y=worst_case_y, mode='lines', 
-        line=dict(color='red', width=2, dash='dash'), 
-        name=f'Theoretical Min (-{MAX_ROUND_NET_UNITS:.0f} units/round)',
-        showlegend=True
-    ))
-    
     fig_traj.update_layout(
         xaxis_title="Hands Played",
         yaxis_title="Bankroll ($)",
@@ -313,15 +332,18 @@ with col_chart1:
 
 with col_chart2:
     st.subheader("📉 Time-to-Ruin Distribution")
-    st.markdown("Histogram showing how many hands it takes to go broke (for those who do).")
-    
-    ttl_ruin_hands = result.ttl_hands[result.ruined]
-    
-    if len(ttl_ruin_hands) > 0:
+    st.markdown(
+        f"Hours until ruin for the {ruin_k:,} sessions that went broke. "
+        f"The other {params.sims - ruin_k:,} survived the full session and are not shown."
+    )
+
+    ttl_ruin_hours = result.ttl_hands[result.ruined] * params.minutes_per_hand / 60.0
+
+    if len(ttl_ruin_hours) > 0:
         fig_hist = px.histogram(
-            x=ttl_ruin_hands,
+            x=ttl_ruin_hours,
             nbins=50,
-            labels={'x': 'Hands Until Ruin', 'y': 'Number of Players'},
+            labels={'x': 'Hours Until Ruin', 'y': 'Number of Sessions'},
             color_discrete_sequence=['#ef553b'] # Plotly Red
         )
         fig_hist.update_layout(
@@ -332,7 +354,7 @@ with col_chart2:
         )
         st.plotly_chart(fig_hist, use_container_width=True)
     else:
-        st.info("Nobody went broke! Try increasing simulations or decreasing starting bankroll.")
+        st.info("No simulated session went broke within the session length.")
 
 st.divider()
 
@@ -373,30 +395,25 @@ with col_chart4:
     st.subheader("⏱️ Ruin Probability by Play Duration")
     st.markdown("Quick reference table for specific session lengths.")
     
-    ruin_data = []
-    for hours in [1, 2, 4, 8, 12, 24, 48]:
-        hand_target = int(round(hours * hands_per_hour))
-        if hand_target <= 0 or hand_target > params.max_hands: 
-            continue
-        
-        # P(ruined by hand_target)
-        ruined_by = np.mean(result.ruined & (result.ttl_hands <= hand_target))
-        ruin_data.append({
-            "Session Length": f"{hours} Hours", 
-            "Hands Played": f"{hand_target:,}", 
-            "Probability of Ruin": f"{ruined_by * 100:.2f}%"
-        })
-    
-    if ruin_data:
-        df_ruin = pd.DataFrame(ruin_data)
-        st.dataframe(
-            df_ruin, 
-            use_container_width=True, 
-            hide_index=True,
-            column_config={
-                "Probability of Ruin": st.column_config.TextColumn(
-                    "Probability of Ruin",
-                    help="Chance your bankroll is empty before this time is up."
-                )
-            }
-        )
+    ruin_data = [
+        {
+            "Session Length": f"{row['hours']:g} Hours",
+            "Hands Played": f"{row['hands']:,}",
+            "Probability of Ruin": f"{row['p_ruin'] * 100:.2f}%",
+            "95% CI": f"{row['ci_low'] * 100:.1f}% – {row['ci_high'] * 100:.1f}%",
+        }
+        for row in ruin_by_hours(params, result)
+    ]
+
+    df_ruin = pd.DataFrame(ruin_data)
+    st.dataframe(
+        df_ruin,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Probability of Ruin": st.column_config.TextColumn(
+                "Probability of Ruin",
+                help="Chance your bankroll is below one bet by this point. Last row is the full simulated session."
+            )
+        }
+    )

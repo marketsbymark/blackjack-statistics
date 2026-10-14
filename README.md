@@ -63,22 +63,44 @@ You can configure:
 
 ## Outputs
 
-- Terminal: input echo, measured EV/SD, house edge, exposure statistics,
-  round-level split/double/DAS probabilities, action counts per round, TTL
-  percentiles, ruin probabilities, all-player ending bankroll, and survivor-only
-  bankroll summary.
+- Terminal: input echo, realized EV per round with 95% CI, SD, exposure
+  statistics, round-level split/double/DAS probabilities, action counts per
+  round, time-to-ruin quantiles (censoring-aware), ruin probabilities by
+  duration with 95% Wilson intervals, all-player ending bankroll, and
+  survivor-only bankroll summary.
 - `bankroll_simulation.xlsx`, with sheets:
   - `Inputs` - parameters, rule set, seed, timestamp
   - `Engine_Stats` - measured EV/SD, exposure, round event rates, and action rates
-  - `Summary` - time-to-live and ruin summary statistics
-  - `TTL_Distribution` - histogram of time-to-ruin in minutes
-  - `Survival_Curve` - P(not yet ruined) at hand checkpoints
+  - `Summary` - time-to-ruin quantiles, ruin rate with CI, ruin by duration
+  - `TTL_Distribution` - histogram of time-to-ruin in minutes for ruined
+    sessions, plus one row counting sessions that survived
+  - `Survival_Curve` - P(not yet ruined) and all-simulation bankroll
+    10th/50th/90th percentiles at hand checkpoints
   - `Sample_Trajectories` - sample bankroll paths frozen at ruin
 
 ## Model notes
+
+All EV figures are per initial round in base-bet units (a split or double adds
+exposure, not rounds). The reported EV is the *realized, bankroll-constrained*
+EV: near ruin the player cannot fund every split or double, which lowers EV
+relative to the unconstrained house edge. Its 95% CI uses a standard error
+clustered by session.
+
+Time-to-ruin quantiles treat survivors as censored at the session length. A
+quantile that is not reached within the session is reported as
+"> max_hands" rather than the session cap.
+
+Ruin probabilities carry 95% Wilson score intervals; at 1,000 simulations a
+ruin rate near 50% is only known to about +/-3 percentage points.
 
 Ruin is defined as bankroll dropping below one base bet before the next round.
 Bankroll is tracked internally in base-bet units, so fractional bets such as
 $0.30 do not trigger false ruin from floating-point rounding.
 Within a round, the player only takes split and double actions that can be
 funded by the bankroll currently available at the table.
+
+## Legacy
+
+`legacy/BankrollMonteCarlo.bas` is the earlier Excel/VBA model driven by a
+fixed outcome-probability table. It does not use the card-level engine and is
+kept for reference only.

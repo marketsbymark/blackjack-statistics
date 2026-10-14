@@ -12,7 +12,10 @@ from bankroll_sim import (
     hand_value,
     is_blackjack,
     play_round,
+    ruin_by_hours,
     simulate,
+    ttl_quantile,
+    wilson_interval,
     write_excel,
     HandState,
 )
@@ -279,6 +282,37 @@ class BlackjackEngineTests(unittest.TestCase):
             set(names),
             {"Inputs", "Engine_Stats", "Summary", "TTL_Distribution", "Survival_Curve", "Sample_Trajectories"},
         )
+
+    def test_wilson_interval_known_value(self):
+        lo, hi = wilson_interval(50, 100)
+        self.assertAlmostEqual(lo, 0.4038, places=3)
+        self.assertAlmostEqual(hi, 0.5962, places=3)
+
+    def test_ttl_quantile_respects_censoring(self):
+        params = SimParams(bet=25, bankroll=500, minutes_per_hand=0.5, sims=200,
+                           max_hands=100, seed=9, n_trajectories=5)
+        result = simulate(params)
+        ruin_rate = result.ruined.mean()
+        self.assertLess(ruin_rate, 0.5)
+        self.assertIsNone(ttl_quantile(result, 0.5))  # median not reached in session
+        if ruin_rate >= 0.10:
+            self.assertLessEqual(ttl_quantile(result, 0.10), params.max_hands)
+
+    def test_ruin_by_hours_stops_at_session_and_ends_with_full_session(self):
+        params = SimParams(bet=25, bankroll=200, minutes_per_hand=1.0, sims=100,
+                           max_hands=150, seed=2, n_trajectories=5)
+        result = simulate(params)
+        rows = ruin_by_hours(params, result)
+        self.assertEqual([r["hands"] for r in rows], [60, 120, 150])
+        self.assertAlmostEqual(rows[-1]["p_ruin"], result.ruined.mean())
+
+    def test_sample_band_covers_all_sims(self):
+        params = SimParams(bet=25, bankroll=300, minutes_per_hand=0.5, sims=300,
+                           max_hands=80, seed=4, n_trajectories=10)
+        result = simulate(params)
+        self.assertEqual(result.survival_hands[0], 0)
+        self.assertEqual(result.band_p50[0], 300.0)
+        self.assertAlmostEqual(result.band_p50[-1], float(np.median(result.ending_bankroll)))
 
     @unittest.skipUnless(os.environ.get("BLACKJACK_SLOW_TESTS"), "set BLACKJACK_SLOW_TESTS=1")
     def test_unconstrained_ev_matches_published_edge(self):

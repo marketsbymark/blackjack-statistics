@@ -20,6 +20,9 @@ DECKS = 6
 RESHUFFLE_AT_CARDS = 78
 MAX_SPLIT_HANDS = 4
 MAX_ROUND_NET_UNITS = MAX_SPLIT_HANDS * 2.0
+N_CHECKPOINTS = 50
+DURATION_HOURS = (1, 2, 4, 8, 12, 24, 48)
+EV_LABEL = "Realized EV per round (bankroll-constrained)"
 
 
 @dataclass
@@ -30,7 +33,6 @@ class SimParams:
     sims: int
     max_hands: int
     seed: int
-    sims_per_batch: int = 2000
     n_trajectories: int = 50
 
 
@@ -42,8 +44,11 @@ class SimResult:
     survival_hands: np.ndarray
     survival_prob: np.ndarray
     sample_paths: np.ndarray
-    round_units: np.ndarray
+    band_p10: np.ndarray
+    band_p50: np.ndarray
+    band_p90: np.ndarray
     ev_units: float
+    ev_se_units: float
     sd_units: float
     avg_exposure_units: float
     max_exposure_units: float
@@ -121,12 +126,11 @@ class Shoe:
 
 
 def hand_value(cards: list[int]) -> tuple[int, bool]:
-    total = sum(11 if card == 1 else card for card in cards)
-    aces_as_eleven = cards.count(1)
-    while total > 21 and aces_as_eleven:
-        total -= 10
-        aces_as_eleven -= 1
-    return total, aces_as_eleven > 0
+    """Best total and whether an ace is being counted as 11 (soft)."""
+    total = sum(cards)
+    if 1 in cards and total + 10 <= 21:
+        return total + 10, True
+    return total, False
 
 
 def is_blackjack(cards: list[int]) -> bool:
@@ -349,31 +353,32 @@ def play_round(shoe: Shoe, bankroll_units: float) -> RoundResult:
     )
 
 
-def validate_pmf() -> tuple[float, float]:
-    """Compatibility shim for older callers.
-
-    The simulator no longer uses a fixed PMF; EV and SD are measured from the
-    simulated card-level rounds.
-    """
-    return 0.0, 0.0
-
-
 def simulate(params: SimParams) -> SimResult:
     rng = np.random.default_rng(params.seed)
 
     ttl_hands = np.empty(params.sims, dtype=np.int64)
     ruined = np.empty(params.sims, dtype=bool)
     ending = np.empty(params.sims, dtype=np.float64)
-    round_units_all: list[float] = []
 
-    n_checkpoints = 50
-    survival_hands = np.linspace(1, params.max_hands, n_checkpoints, dtype=np.int64)
-    survival_hits = np.zeros(n_checkpoints, dtype=np.int64)
+    # Checkpoints include hand 0 (P = 1) and are de-duplicated for short sessions.
+    survival_hands = np.unique(
+        np.linspace(0, params.max_hands, N_CHECKPOINTS + 1).round().astype(np.int64)
+    )
+    survival_hits = np.zeros(survival_hands.size, dtype=np.int64)
+    checkpoint_bankroll = np.empty((params.sims, survival_hands.size), dtype=np.float64)
 
     n_samples = min(params.n_trajectories, params.sims)
     sample_paths = np.empty((n_samples, params.max_hands + 1), dtype=np.float64)
+    path = np.empty(params.max_hands + 1, dtype=np.float64)
 
-    exposures: list[float] = []
+    # Per-session sums feed a cluster-robust SE for EV: rounds within one
+    # session share a shoe and a bankroll, so they are not independent.
+    path_net = np.zeros(params.sims, dtype=np.float64)
+    path_rounds = np.zeros(params.sims, dtype=np.int64)
+    sum_sq_units = 0.0
+    sum_exposure = 0.0
+    max_exposure_seen = 0.0
+
     hands_played_total = 0
     splits_total = 0
     doubles_total = 0
@@ -398,10 +403,8 @@ def simulate(params: SimParams) -> SimResult:
         shoe = Shoe(rng)
         bankroll_units = start_units
         bankroll = bankroll_units * params.bet
-        path = None
-        if sim_idx < n_samples:
-            path = sample_paths[sim_idx]
-            path[0] = bankroll
+        path[0] = bankroll
+        net_this_path = 0.0
 
         ttl = params.max_hands
         is_ruined = False
@@ -410,16 +413,20 @@ def simulate(params: SimParams) -> SimResult:
             if bankroll_units < 1.0:
                 ttl = hand_idx - 1
                 is_ruined = True
-                if path is not None:
-                    path[hand_idx:] = bankroll
+                path[hand_idx:] = bankroll
                 break
 
             result = play_round(shoe, bankroll_units)
-            bankroll_units += result.net_units
+            net = result.net_units
+            bankroll_units += net
             bankroll = bankroll_units * params.bet
+            path[hand_idx] = bankroll
 
-            round_units_all.append(result.net_units)
-            exposures.append(result.exposure_units)
+            net_this_path += net
+            sum_sq_units += net * net
+            sum_exposure += result.exposure_units
+            if result.exposure_units > max_exposure_seen:
+                max_exposure_seen = result.exposure_units
             hands_played_total += 1
             splits_total += result.splits
             doubles_total += result.doubles
@@ -435,20 +442,17 @@ def simulate(params: SimParams) -> SimResult:
             push_rounds_total += int(result.pushes > 0)
             player_bust_rounds_total += int(result.player_busts > 0)
 
-            if path is not None:
-                path[hand_idx] = bankroll
-
             if bankroll_units < 1.0:
                 ttl = hand_idx
                 is_ruined = True
-                if path is not None and hand_idx < params.max_hands:
-                    path[hand_idx + 1 :] = bankroll
+                path[hand_idx + 1 :] = bankroll
                 break
 
-        if path is not None and not is_ruined:
-            filled_to = ttl
-            if filled_to < params.max_hands:
-                path[filled_to + 1 :] = bankroll
+        if sim_idx < n_samples:
+            sample_paths[sim_idx] = path
+        checkpoint_bankroll[sim_idx] = path[survival_hands]
+        path_net[sim_idx] = net_this_path
+        path_rounds[sim_idx] = ttl
 
         ttl_hands[sim_idx] = ttl
         ruined[sim_idx] = is_ruined
@@ -456,13 +460,13 @@ def simulate(params: SimParams) -> SimResult:
         survival_check = ttl if is_ruined else params.max_hands + 1
         survival_hits += (survival_check > survival_hands).astype(np.int64)
 
-    round_units = np.array(round_units_all, dtype=np.float64)
-    exposure_arr = np.array(exposures, dtype=np.float64)
-    ev_units = float(round_units.mean()) if round_units.size else 0.0
-    sd_units = float(round_units.std(ddof=0)) if round_units.size else 0.0
-    avg_exposure = float(exposure_arr.mean()) if exposure_arr.size else 0.0
-    max_exposure = float(exposure_arr.max()) if exposure_arr.size else 0.0
-    denom = float(hands_played_total) if hands_played_total else 1.0
+    n = hands_played_total
+    ev_units = float(path_net.sum() / n) if n else 0.0
+    sd_units = float(np.sqrt(max(sum_sq_units / n - ev_units**2, 0.0))) if n else 0.0
+    ev_se_units = _clustered_ratio_se(path_net, path_rounds, ev_units)
+    denom = float(n) if n else 1.0
+
+    band_q = np.percentile(checkpoint_bankroll, [10, 50, 90], axis=0)
 
     return SimResult(
         ttl_hands=ttl_hands,
@@ -471,11 +475,14 @@ def simulate(params: SimParams) -> SimResult:
         survival_hands=survival_hands,
         survival_prob=survival_hits / params.sims,
         sample_paths=sample_paths,
-        round_units=round_units,
+        band_p10=band_q[0],
+        band_p50=band_q[1],
+        band_p90=band_q[2],
         ev_units=ev_units,
+        ev_se_units=ev_se_units,
         sd_units=sd_units,
-        avg_exposure_units=avg_exposure,
-        max_exposure_units=max_exposure,
+        avg_exposure_units=sum_exposure / n if n else 0.0,
+        max_exposure_units=max_exposure_seen,
         split_rate=split_rounds_total / denom,
         double_rate=double_rounds_total / denom,
         das_rate=das_rounds_total / denom,
@@ -502,6 +509,67 @@ def simulate(params: SimParams) -> SimResult:
         push_rounds_total=push_rounds_total,
         player_bust_rounds_total=player_bust_rounds_total,
     )
+
+
+def _clustered_ratio_se(path_net: np.ndarray, path_rounds: np.ndarray, ev: float) -> float:
+    """SE of EV = sum(net) / sum(rounds), clustered by session.
+
+    Var(EV) ~= S/(S-1) * sum_i (net_i - EV * rounds_i)^2 / (sum_i rounds_i)^2
+    """
+    total_rounds = float(path_rounds.sum())
+    s = path_net.size
+    if s < 2 or total_rounds == 0:
+        return float("nan")
+    resid = path_net - ev * path_rounds
+    return float(np.sqrt(s / (s - 1) * np.sum(resid**2)) / total_rounds)
+
+
+def wilson_interval(successes: int, n: int, z: float = 1.96) -> tuple[float, float]:
+    """Wilson score interval for a binomial proportion (95% by default)."""
+    if n == 0:
+        return float("nan"), float("nan")
+    p = successes / n
+    denom = 1.0 + z**2 / n
+    centre = (p + z**2 / (2 * n)) / denom
+    half = z * np.sqrt(p * (1 - p) / n + z**2 / (4 * n**2)) / denom
+    return max(0.0, float(centre - half)), min(1.0, float(centre + half))
+
+
+def ttl_quantile(result: SimResult, q: float) -> int | None:
+    """Hands until ruin at quantile q of the time-to-ruin distribution.
+
+    Every survivor is censored at the same point (max_hands), so the
+    Kaplan-Meier estimate equals the empirical one. Returns None when fewer
+    than q of sessions are ruined within the session ("> max_hands").
+    """
+    needed = int(np.ceil(q * result.ruined.size))
+    ruined_ttl = np.sort(result.ttl_hands[result.ruined])
+    if needed == 0 or ruined_ttl.size < needed:
+        return None
+    return int(ruined_ttl[needed - 1])
+
+
+def ruin_by_hours(
+    params: SimParams, result: SimResult, hours: tuple[float, ...] = DURATION_HOURS
+) -> list[dict]:
+    """P(ruined by H hours) with 95% Wilson CI, limited to the simulated session.
+
+    Always ends with a row for the full session length.
+    """
+    hands_per_hour = 60.0 / params.minutes_per_hand
+    targets = []
+    for h in hours:
+        hand_target = int(round(h * hands_per_hour))
+        if 0 < hand_target < params.max_hands:
+            targets.append((float(h), hand_target))
+    targets.append((params.max_hands / hands_per_hour, params.max_hands))
+
+    rows = []
+    for h, hand_target in targets:
+        k = int(np.sum(result.ruined & (result.ttl_hands <= hand_target)))
+        lo, hi = wilson_interval(k, params.sims)
+        rows.append({"hours": h, "hands": hand_target, "p_ruin": k / params.sims, "ci_low": lo, "ci_high": hi})
+    return rows
 
 
 def prompt_float(label: str, default: float) -> float:
@@ -544,26 +612,29 @@ def collect_inputs() -> SimParams:
     )
 
 
-def percentile_row(arr: np.ndarray, multiplier: float = 1.0) -> dict:
-    return {
-        "mean": float(np.mean(arr)) * multiplier,
-        "p10": float(np.percentile(arr, 10)) * multiplier,
-        "p25": float(np.percentile(arr, 25)) * multiplier,
-        "median": float(np.median(arr)) * multiplier,
-        "p75": float(np.percentile(arr, 75)) * multiplier,
-        "p90": float(np.percentile(arr, 90)) * multiplier,
-    }
+TTL_QUANTILES = (0.10, 0.25, 0.50, 0.75, 0.90)
+
+
+def ttl_rows(params: SimParams, result: SimResult) -> list[tuple[str, int | None]]:
+    """Time-to-ruin quantiles in hands; None means beyond the session."""
+    return [(f"p{int(q * 100)}", ttl_quantile(result, q)) for q in TTL_QUANTILES]
+
+
+def _fmt_hands(h: int | None, params: SimParams) -> str:
+    if h is None:
+        return f"> {params.max_hands:,} hands (session end)"
+    return f"{h:,} hands ({h * params.minutes_per_hand / 60.0:.2f} h)"
 
 
 def print_terminal_report(params: SimParams, result: SimResult) -> None:
-    ttl_hands = result.ttl_hands
-    ttl_minutes = ttl_hands * params.minutes_per_hand
-    ttl_hours = ttl_minutes / 60.0
-    ruin_rate = float(result.ruined.mean())
+    ruin_k = int(result.ruined.sum())
+    ruin_rate = ruin_k / params.sims
+    ruin_lo, ruin_hi = wilson_interval(ruin_k, params.sims)
 
     dollar_loss_per_hand = -result.ev_units * params.bet
     hands_per_hour = 60.0 / params.minutes_per_hand
     ev_dollar_loss_per_hour = dollar_loss_per_hand * hands_per_hour
+    ev_ci = 1.96 * result.ev_se_units
 
     print()
     print("-" * 60)
@@ -579,12 +650,12 @@ def print_terminal_report(params: SimParams, result: SimResult) -> None:
 
     print()
     print("-" * 60)
-    print(" Engine statistics")
+    print(" Engine statistics (per initial round, base-bet units)")
     print("-" * 60)
     print(f"  Rounds played       : {result.hands_played_total:,}")
-    print(f"  E[X] (units)        : {result.ev_units:+.5f}")
-    print(f"  SD[X] (units)       : {result.sd_units:.5f}")
-    print(f"  House edge          : {-result.ev_units * 100:.3f}%")
+    print(f"  {EV_LABEL}:")
+    print(f"                        {result.ev_units:+.5f} units  (95% CI +/- {ev_ci:.5f})")
+    print(f"  SD per round        : {result.sd_units:.5f} units")
     print(f"  Avg exposure        : {result.avg_exposure_units:.3f} units")
     print(f"  Max exposure        : {result.max_exposure_units:.1f} units")
     print(f"  Rounds with split   : {result.split_rate * 100:.2f}%")
@@ -598,43 +669,34 @@ def print_terminal_report(params: SimParams, result: SimResult) -> None:
 
     print()
     print("-" * 60)
-    print(" Time-to-Live (TTL)")
+    print(" Time to ruin (survivors censored at session end)")
     print("-" * 60)
-    stats_hands = percentile_row(ttl_hands)
-    stats_min = percentile_row(ttl_minutes)
-    stats_hr = percentile_row(ttl_hours)
-    header = f"  {'stat':<8}{'hands':>12}{'minutes':>14}{'hours':>12}"
-    print(header)
-    for key in ("mean", "p10", "p25", "median", "p75", "p90"):
-        print(
-            f"  {key:<8}{stats_hands[key]:>12,.1f}"
-            f"{stats_min[key]:>14,.1f}{stats_hr[key]:>12.2f}"
-        )
+    for label, h in ttl_rows(params, result):
+        print(f"  {label:<6}: {_fmt_hands(h, params)}")
+    mean_played = float(result.ttl_hands.mean())
+    print(f"  mean hands played (capped at {params.max_hands:,}): {mean_played:,.1f}")
 
     print()
     print("-" * 60)
-    print(" Ruin probability by play duration")
+    print(" Ruin probability by play duration (95% Wilson CI)")
     print("-" * 60)
-    for hours in (1, 2, 4, 8):
-        hand_target = int(round(hours * hands_per_hour))
-        if hand_target <= 0:
-            continue
-        ruined_by = np.mean(result.ruined & (ttl_hands <= hand_target))
+    for row in ruin_by_hours(params, result):
         print(
-            f"  by {hours:>2}h ({hand_target:>6,} hands) : "
-            f"P(ruin) = {ruined_by * 100:5.2f}%"
+            f"  by {row['hours']:>5.2f}h ({row['hands']:>6,} hands) : "
+            f"{row['p_ruin'] * 100:5.2f}%  [{row['ci_low'] * 100:5.2f}%, {row['ci_high'] * 100:5.2f}%]"
         )
-    print(f"  overall ruin rate (<= {params.max_hands:,} hands): {ruin_rate * 100:.2f}%")
+    print(
+        f"  overall ruin rate (<= {params.max_hands:,} hands): {ruin_rate * 100:.2f}% "
+        f"[{ruin_lo * 100:.2f}%, {ruin_hi * 100:.2f}%]"
+    )
 
+    print(f"  mean ending bankroll (all sims, incl. ruined): ${float(np.mean(result.ending_bankroll)):,.2f}")
     survivors = result.ending_bankroll[~result.ruined]
     if survivors.size:
         print(f"  mean ending bankroll among survivors: ${float(np.mean(survivors)):,.2f}")
 
 
 def write_excel(params: SimParams, result: SimResult, path: str) -> None:
-    ttl_hands = result.ttl_hands
-    ttl_minutes = ttl_hands * params.minutes_per_hand
-    ttl_hours = ttl_minutes / 60.0
     hands_per_hour = 60.0 / params.minutes_per_hand
 
     inputs_df = pd.DataFrame(
@@ -655,9 +717,9 @@ def write_excel(params: SimParams, result: SimResult, path: str) -> None:
     engine_df = pd.DataFrame(
         [
             ("Rounds played", result.hands_played_total),
-            ("E[X] (units)", result.ev_units),
-            ("SD[X] (units)", result.sd_units),
-            ("House edge", -result.ev_units),
+            (f"{EV_LABEL} (units)", result.ev_units),
+            ("EV standard error (units, clustered by session)", result.ev_se_units),
+            ("SD per round (units)", result.sd_units),
             ("Average exposure (units)", result.avg_exposure_units),
             ("Max exposure (units)", result.max_exposure_units),
             ("Rounds with split", result.split_rate),
@@ -669,7 +731,7 @@ def write_excel(params: SimParams, result: SimResult, path: str) -> None:
             ("Blackjack rate", result.blackjack_rate),
             ("Push rate", result.push_rate),
             ("Player bust rate", result.player_bust_rate),
-            ("Dealer bust rate", result.dealer_bust_rate),
+            ("Dealer bust rate (dealer draws only if a player hand is live)", result.dealer_bust_rate),
             ("Multi-bet round rate", result.multi_bet_rate),
             ("Total splits", result.splits_total),
             ("Total doubles", result.doubles_total),
@@ -681,26 +743,19 @@ def write_excel(params: SimParams, result: SimResult, path: str) -> None:
         columns=["Metric", "Value"],
     )
 
-    def stats_block(arr: np.ndarray) -> dict:
-        return {
-            "mean": float(np.mean(arr)),
-            "p10": float(np.percentile(arr, 10)),
-            "p25": float(np.percentile(arr, 25)),
-            "median": float(np.median(arr)),
-            "p75": float(np.percentile(arr, 75)),
-            "p90": float(np.percentile(arr, 90)),
-        }
-
-    s_hands = stats_block(ttl_hands)
-    s_min = stats_block(ttl_minutes)
-    s_hr = stats_block(ttl_hours)
-    summary_rows = []
-    for key in ("mean", "p10", "p25", "median", "p75", "p90"):
-        summary_rows.append((f"TTL {key} (hands)", s_hands[key]))
-        summary_rows.append((f"TTL {key} (minutes)", s_min[key]))
-        summary_rows.append((f"TTL {key} (hours)", s_hr[key]))
-    summary_rows.append(("Ruin rate", float(result.ruined.mean())))
-    summary_rows.append(("Mean ending bankroll (all simulations)", float(np.mean(result.ending_bankroll))))
+    summary_rows: list[tuple[str, object]] = []
+    for label, h in ttl_rows(params, result):
+        summary_rows.append((f"Time to ruin {label} (hands)", h if h is not None else f"> {params.max_hands}"))
+        summary_rows.append(
+            (f"Time to ruin {label} (hours)", h * params.minutes_per_hand / 60.0 if h is not None else "beyond session")
+        )
+    summary_rows.append((f"Mean hands played (capped at {params.max_hands})", float(result.ttl_hands.mean())))
+    ruin_k = int(result.ruined.sum())
+    ruin_lo, ruin_hi = wilson_interval(ruin_k, params.sims)
+    summary_rows.append(("Ruin rate", ruin_k / params.sims))
+    summary_rows.append(("Ruin rate 95% CI low", ruin_lo))
+    summary_rows.append(("Ruin rate 95% CI high", ruin_hi))
+    summary_rows.append(("Mean ending bankroll (all simulations, incl. ruined)", float(np.mean(result.ending_bankroll))))
     summary_rows.append(
         (
             "Mean net result (all simulations)",
@@ -715,22 +770,24 @@ def write_excel(params: SimParams, result: SimResult, path: str) -> None:
         )
     )
     summary_rows.append(("EV $ loss per hour", -result.ev_units * params.bet * hands_per_hour))
-    for hours in (1, 2, 4, 8):
-        hand_target = int(round(hours * hands_per_hour))
-        ruined_by = float(np.mean(result.ruined & (ttl_hands <= hand_target)))
-        summary_rows.append((f"P(ruin) by {hours}h", ruined_by))
+    for row in ruin_by_hours(params, result):
+        summary_rows.append((f"P(ruin) by {row['hours']:.2f}h ({row['hands']} hands)", row["p_ruin"]))
     summary_df = pd.DataFrame(summary_rows, columns=["Metric", "Value"])
 
-    max_minutes = float(ttl_minutes.max())
+    # Histogram of time to ruin for ruined sessions; survivors reported separately.
+    ruined_minutes = result.ttl_hands[result.ruined] * params.minutes_per_hand
     n_bins = 60
-    bin_edges = np.linspace(0, max(max_minutes, params.minutes_per_hand), n_bins + 1)
-    counts, _ = np.histogram(ttl_minutes, bins=bin_edges)
+    session_minutes = params.max_hands * params.minutes_per_hand
+    bin_edges = np.linspace(0, session_minutes, n_bins + 1)
+    counts, _ = np.histogram(ruined_minutes, bins=bin_edges)
+    n_survivors = int((~result.ruined).sum())
     ttl_dist_df = pd.DataFrame(
         {
-            "bin_low_minutes": bin_edges[:-1],
-            "bin_high_minutes": bin_edges[1:],
-            "count": counts,
-            "probability": counts / params.sims,
+            "bin_low_minutes": np.append(bin_edges[:-1], session_minutes),
+            "bin_high_minutes": np.append(bin_edges[1:], np.inf),
+            "count": np.append(counts, n_survivors),
+            "probability": np.append(counts, n_survivors) / params.sims,
+            "status": ["ruined"] * n_bins + ["survived session"],
         }
     )
 
@@ -739,6 +796,9 @@ def write_excel(params: SimParams, result: SimResult, path: str) -> None:
             "hand_index": result.survival_hands,
             "minutes": result.survival_hands * params.minutes_per_hand,
             "P(bankroll >= bet)": result.survival_prob,
+            "bankroll_p10": result.band_p10,
+            "bankroll_median": result.band_p50,
+            "bankroll_p90": result.band_p90,
         }
     )
 

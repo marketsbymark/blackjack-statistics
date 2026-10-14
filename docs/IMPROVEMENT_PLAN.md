@@ -45,7 +45,7 @@ looked plausible. 10M rounds, effectively unlimited bankroll:
   sheets present.
 - Replace the +/-20 sigma EV test with a tighter slow test.
 
-## Phase 3 - Statistical presentation
+## Phase 3 - Statistical presentation (DONE)
 
 1. Report Monte Carlo error: Wilson 95% CI for ruin / survival, SE for EV.
 2. Rename "House edge" -> realized EV per round (bankroll-constrained). Gating
@@ -59,7 +59,7 @@ looked plausible. 10M rounds, effectively unlimited bankroll:
    Remove theoretical +/-8 units/round lines (off-chart / unreachable -$100).
 6. Survival curve: include hand 0, dedupe checkpoints. Dealer bust rate label.
 
-## Phase 4 - Dashboard bugs / UX
+## Phase 4 - Dashboard bugs / UX (DONE)
 
 - `st.metric` delta strings like `"$-123"` render an up arrow; pass numbers.
 - Negative seed crashes `default_rng`; `min_value=0`.
@@ -67,14 +67,14 @@ looked plausible. 10M rounds, effectively unlimited bankroll:
 - Ruin-by-duration table: always include full session row.
 - Plot trajectories as one trace with NaN separators.
 
-## Phase 5 - Performance / memory
+## Phase 5 - Performance / memory (PARTIAL: running sums + hand_value done; multiprocessing open)
 
 - Per-round Python lists (~0.6 GB at 9.6M rounds) -> running sums.
   Drop unused `SimResult.round_units`.
 - `hand_value` without generator (~25% faster, identical results).
 - Optional: multiprocessing with `SeedSequence.spawn` (~2x on 4 cores).
 
-## Phase 6 - Maintainability / hygiene
+## Phase 6 - Maintainability / hygiene (PARTIAL: dead code, shared ruin helper, legacy/ move, README done; .vscode, module split, pinning, CI open)
 
 - Remove dead code (`validate_pmf`, `sims_per_batch`, `stats_block` duplicate).
 - Single shared ruin-by-hours helper used by terminal, Excel and app.
