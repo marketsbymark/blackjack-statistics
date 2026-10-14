@@ -159,12 +159,14 @@ def _hard_strategy(total: int, dealer_up: int, allow_double: bool) -> str:
 
 
 def _soft_strategy(total: int, dealer_up: int, allow_double: bool) -> str:
-    if total >= 19:
+    if total >= 20:
         return "stand"
+    if total == 19:
+        return "double" if allow_double and dealer_up == 6 else "stand"
     if total == 18:
         if allow_double and 2 <= dealer_up <= 6:
             return "double"
-        return "stand" if dealer_up in (7, 8) else "hit"
+        return "stand" if 2 <= dealer_up <= 8 else "hit"
     if total == 17:
         return "double" if allow_double and 3 <= dealer_up <= 6 else "hit"
     if total in (15, 16):
@@ -288,6 +290,10 @@ def play_round(shoe: Shoe, bankroll_units: float) -> RoundResult:
                     committed += 1.0
                     max_exposure = max(max_exposure, committed)
                     splits += 1
+                    if split_aces:
+                        # Split aces receive exactly one card each and stand.
+                        hand.stood = True
+                        break
                     continue
                 decision = _fallback_after_declined_split(hand, dealer_up, allow_double)
 
@@ -383,9 +389,15 @@ def simulate(params: SimParams) -> SimResult:
     push_rounds_total = 0
     player_bust_rounds_total = 0
 
+    # Bankroll is tracked in base-bet units. Round outcomes are exact
+    # multiples of 0.5 units, so only the starting ratio can carry float
+    # noise (e.g. 0.9 / 0.3); rounding it removes false ruin / gating.
+    start_units = round(params.bankroll / params.bet, 9)
+
     for sim_idx in range(params.sims):
         shoe = Shoe(rng)
-        bankroll = float(params.bankroll)
+        bankroll_units = start_units
+        bankroll = bankroll_units * params.bet
         path = None
         if sim_idx < n_samples:
             path = sample_paths[sim_idx]
@@ -395,13 +407,16 @@ def simulate(params: SimParams) -> SimResult:
         is_ruined = False
 
         for hand_idx in range(1, params.max_hands + 1):
-            if bankroll < params.bet:
+            if bankroll_units < 1.0:
                 ttl = hand_idx - 1
                 is_ruined = True
+                if path is not None:
+                    path[hand_idx:] = bankroll
                 break
 
-            result = play_round(shoe, bankroll / params.bet)
-            bankroll += result.net_units * params.bet
+            result = play_round(shoe, bankroll_units)
+            bankroll_units += result.net_units
+            bankroll = bankroll_units * params.bet
 
             round_units_all.append(result.net_units)
             exposures.append(result.exposure_units)
@@ -423,7 +438,7 @@ def simulate(params: SimParams) -> SimResult:
             if path is not None:
                 path[hand_idx] = bankroll
 
-            if bankroll < params.bet:
+            if bankroll_units < 1.0:
                 ttl = hand_idx
                 is_ruined = True
                 if path is not None and hand_idx < params.max_hands:

@@ -20,7 +20,7 @@ looked plausible. 10M rounds, effectively unlimited bankroll:
 | As of 59143a0 | -0.577% +/- 0.037% | 1.160 |
 | Bugs 1.1 + 1.2 (+1.3) fixed | -0.683% +/- 0.037% | 1.160 |
 
-## Phase 1 - Engine correctness
+## Phase 1 - Engine correctness (DONE)
 
 1. **Split aces:** the first ace hand re-entered the inner action loop and could
    hit/double (only the inserted second hand was frozen).
@@ -35,7 +35,7 @@ looked plausible. 10M rounds, effectively unlimited bankroll:
 5. **Bankroll < bet at start:** sample paths left as `np.empty` garbage.
    Fill the path; dashboard should not allow bankroll < bet.
 
-## Phase 2 - Tests
+## Phase 2 - Tests (DONE)
 
 - Full strategy-grid regression (hard/soft/pair x upcard, double allowed/not).
 - Fix vacuous tests: split-aces test (both aces drew 10s), split-cap test

@@ -20,6 +20,16 @@ extra bankroll exposure required by those decisions are modeled directly.
 When the player cannot afford a recommended split or double, the engine falls
 back to the best legal lower-exposure basic-strategy action.
 
+## Tests
+
+```powershell
+python -m unittest discover -s tests
+```
+
+The suite includes a full basic-strategy grid check against a 4-8 deck H17 DAS
+chart. A slow ~1M-round EV check is opt-in:
+`BLACKJACK_SLOW_TESTS=1 python -m unittest discover -s tests`.
+
 ## Install
 
 ```powershell
@@ -68,5 +78,7 @@ You can configure:
 ## Model notes
 
 Ruin is defined as bankroll dropping below one base bet before the next round.
+Bankroll is tracked internally in base-bet units, so fractional bets such as
+$0.30 do not trigger false ruin from floating-point rounding.
 Within a round, the player only takes split and double actions that can be
 funded by the bankroll currently available at the table.
