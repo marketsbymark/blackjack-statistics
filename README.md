@@ -15,7 +15,9 @@ extra bankroll exposure required by those decisions are modeled directly.
 - Split up to 4 total hands
 - Split aces receive one card only and cannot be re-split
 - Embedded H17/DAS basic strategy
-- Flat base bet with table-realistic bankroll gating
+- $25 table minimum; every flat base bet must be at least $25
+- Full flat bet required before every round; no smaller all-in or rounded-up bets
+- Exact integer-cent bankroll accounting; bets use $0.02 increments so 3:2 payouts are exact
 
 When the player cannot afford a recommended split or double, the engine falls
 back to the best legal lower-exposure basic-strategy action.
@@ -67,6 +69,36 @@ You can configure:
 
 ## Model notes
 
-Ruin is defined as bankroll dropping below one base bet before the next round.
+Ruin means the bankroll is below the full configured flat bet, including at the
+start or after the final round. At a $25 flat bet, $25.00 can play and $24.99
+cannot. A $12.50 remainder is retained and the player is done. At a $50 flat
+bet, a $37.50 balance also stops: the flat bet never shrinks. Starting below
+the flat bet produces zero rounds and a constant bankroll trajectory.
 Within a round, the player only takes split and double actions that can be
 funded by the bankroll currently available at the table.
+
+
+Reported EV and loss per active hour are sample estimates from the rounds
+actually played, including bankroll constraints. They are not the theoretical
+house edge or a guaranteed hourly loss. A short simulation can show a player
+advantage through sampling variation. Split/double event rates are per initial
+round; action rates can count multiple actions in the same round.
+
+Session-capped duration statistics include survivors at the horizon; their actual
+time to ruin is unknown. The time-to-ruin histogram includes stopped players
+only, and its probabilities use all simulated players as the denominator.
+Duration-specific ruin probabilities are reported only within the simulated
+horizon. Session lengths use only complete rounds (floor, never rounding up).
+
+The dashboard displays the parameters of its last run and warns when sidebar
+inputs have changed. The old fixed-outcome VBA model is retired: its public
+entry points display an explanation without changing workbook results. It could
+not correctly fund split/double decisions and its state rounding and bankroll
+ceiling made its “exact” results incompatible with the current card engine.
+Use Python's Excel export for current results.
+
+Run rule, accounting, reporting, and dashboard checks:
+
+```sh
+python -m unittest discover -s tests -v
+```

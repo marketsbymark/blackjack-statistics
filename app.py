@@ -5,7 +5,7 @@ import plotly.graph_objects as go
 import plotly.express as px
 
 # Import simulation logic from the existing script
-from bankroll_sim import MAX_ROUND_NET_UNITS, RULE_SET, SimParams, simulate
+from bankroll_sim import TABLE_MINIMUM, RULE_SET, SimParams, simulate
 
 # -----------------------------------------------------------------------------
 # Streamlit Page Config
@@ -27,6 +27,9 @@ card-level Monte Carlo simulation estimating how long your bankroll will last un
 
 **Rules Modeled:** 6-deck shoe, H17, DAS, blackjack pays 3:2, no surrender/insurance,
 basic strategy, flat betting, split to 4 hands, split aces receive one card only.
+
+**$25 table minimum:** Every initial bet is at least $25. Players stop as soon as
+they cannot fund their full flat bet. Any remaining balance is retained; it is never wagered below the minimum.
 """)
 
 # -----------------------------------------------------------------------------
@@ -35,12 +38,14 @@ basic strategy, flat betting, split to 4 hands, split aces receive one card only
 with st.sidebar:
     st.header("⚙️ Simulation Parameters")
     
-    bet = st.number_input("Dollars per hand", min_value=1.0, value=25.0, step=5.0)
-    bankroll = st.number_input("Starting bankroll ($)", min_value=1.0, value=500.0, step=50.0)
+    bet = st.number_input("Flat bet per round ($)", min_value=TABLE_MINIMUM, value=25.0, step=5.0)
+    bankroll = st.number_input("Starting bankroll ($)", min_value=0.0, value=500.0, step=50.0)
     minutes_per_hand = st.number_input("Minutes per hand", min_value=0.1, value=0.75, step=0.1)
     session_hours = st.number_input("Session length (hours)", min_value=0.25, value=4.0, step=0.25)
-    max_hands = max(1, int(round((session_hours * 60.0) / minutes_per_hand)))
-    st.caption(f"Simulating about {max_hands:,} hands per session.")
+    max_hands = int((session_hours * 60.0) / minutes_per_hand)
+    st.caption(f"Simulating {max_hands:,} complete rounds per session; table minimum $25.")
+    if bankroll < bet:
+        st.info("Starting bankroll is below the flat bet: this player is done and will play zero rounds.")
     
     st.divider()
     
@@ -65,7 +70,7 @@ with st.sidebar:
 # Run Simulation
 # -----------------------------------------------------------------------------
 if run_sim or "result" not in st.session_state:
-    with st.spinner("Rolling the dice (running simulation)..."):
+    with st.spinner("Dealing cards (running simulation)..."):
         # Build parameters
         params = SimParams(
             bet=float(bet),
@@ -78,7 +83,11 @@ if run_sim or "result" not in st.session_state:
         )
         
         # Run core logic
-        result = simulate(params)
+        try:
+            result = simulate(params)
+        except ValueError as exc:
+            st.error(str(exc))
+            st.stop()
         
         # Cache results in session state so changing tabs/interacting doesn't re-run
         st.session_state["result"] = result
@@ -89,6 +98,10 @@ if run_sim or "result" not in st.session_state:
 # -----------------------------------------------------------------------------
 result = st.session_state["result"]
 params = st.session_state["params"]
+if (bet, bankroll, minutes_per_hand, sims, max_hands, seed, n_trajectories) != (
+    params.bet, params.bankroll, params.minutes_per_hand, params.sims, params.max_hands, params.seed, params.n_trajectories
+):
+    st.info("Inputs changed. Run Simulation to refresh the results below.")
 ev = result.ev_units
 sd = result.sd_units
 
@@ -98,7 +111,7 @@ dollar_loss_per_hand = -ev * params.bet
 hands_per_hour = 60.0 / params.minutes_per_hand
 ev_dollar_loss_per_hour = dollar_loss_per_hand * hands_per_hour
 survivors = result.ending_bankroll[~result.ruined]
-mean_survivor_bankroll = float(np.mean(survivors)) if survivors.size else 0.0
+mean_survivor_bankroll = float(np.mean(survivors)) if survivors.size else None
 mean_ending_bankroll = float(np.mean(result.ending_bankroll))
 mean_net_result = mean_ending_bankroll - params.bankroll
 
@@ -111,24 +124,25 @@ col1, col2, col3, col4 = st.columns(4)
 col1.metric(
     label="Overall Ruin Probability", 
     value=f"{ruin_rate * 100:.1f}%", 
-    help="Chance of losing the ability to make the minimum bet before reaching max hands."
+    help="Chance of losing the ability to make the minimum bet by session end, including after the last round."
 )
 col2.metric(
-    label="House Edge", 
-    value=f"{-ev * 100:.2f}%",
-    delta=f"EV: {ev:.4f} units/hand",
-    delta_color="inverse"
+    label="Observed Loss / Base Bet",
+    value=f"{-ev * 100:.2f}%" if result.hands_played_total else "N/A",
+    delta=f"EV: {ev:.4f} units/round" if result.hands_played_total else None,
+    delta_color="off",
+    help="Sample estimate from these bankroll-constrained rounds; not the theoretical house edge."
 )
 col3.metric(
-    label="Expected Loss per Hour", 
-    value=f"${ev_dollar_loss_per_hour:.2f}",
-    help=f"At {hands_per_hour:.1f} hands/hour and ${params.bet}/hand."
+    label="Observed Loss / Active Hour",
+    value=f"${ev_dollar_loss_per_hour:.2f}" if result.hands_played_total else "N/A",
+    help=f"Observed round average scaled to {hands_per_hour:.1f} rounds/hour and ${params.bet}/round. Excludes stopped time."
 )
 col4.metric(
     label="Mean Ending Bankroll",
     value=f"${mean_ending_bankroll:,.2f}",
     delta=f"${mean_net_result:,.2f} vs start",
-    delta_color="normal" if mean_net_result >= 0 else "inverse",
+    delta_color="normal",
     help="Average final bankroll across every simulation, including ruined players."
 )
 
@@ -138,11 +152,11 @@ surv_col1, surv_col2 = st.columns(2)
 surv_col1.metric(
     label="Survivors",
     value=f"{survivors.size:,} / {params.sims:,}",
-    help="Simulations that did not hit ruin before max hands."
+    help="Simulations still able to fund the full flat bet after the final round."
 )
 surv_col2.metric(
     label="Mean Survivor Bankroll",
-    value=f"${mean_survivor_bankroll:,.2f}",
+    value=f"${mean_survivor_bankroll:,.2f}" if mean_survivor_bankroll is not None else "N/A",
     help="Conditional average among survivors only. This is intentionally separated because it excludes ruined players."
 )
 
@@ -253,7 +267,7 @@ with col_chart1:
         y=params.bet, 
         line_dash="dash", 
         line_color="red", 
-        annotation_text="Ruin Line",
+        annotation_text=f"Full flat bet: ${params.bet:,.2f} (stop below)",
         annotation_position="bottom right"
     )
     
@@ -262,34 +276,12 @@ with col_chart1:
     fig_traj.add_trace(go.Scatter(
         x=x_axis, y=p50_path, mode='lines', 
         line=dict(color='white', width=3), 
-        name='50th Percentile (Median)',
+        name='Sample median',
         showlegend=True
     ))
 
-    # Theoretical extreme case: split to 4 hands, double all 4, win every doubled hand.
-    best_case_y = params.bankroll + (x_axis * params.bet * MAX_ROUND_NET_UNITS)
-    fig_traj.add_trace(go.Scatter(
-        x=x_axis, y=best_case_y, mode='lines', 
-        line=dict(color='gold', width=2, dash='dash'), 
-        name=f'Theoretical Max (+{MAX_ROUND_NET_UNITS:.0f} units/round)',
-        showlegend=True
-    ))
-    
-    # Theoretical extreme loss mirrors the max funded split/double exposure.
-    worst_case_y = params.bankroll + (x_axis * params.bet * -MAX_ROUND_NET_UNITS)
-    ruin_indices = np.where(worst_case_y < params.bet)[0]
-    if len(ruin_indices) > 0:
-        worst_case_y[ruin_indices[0]:] = worst_case_y[ruin_indices[0]]
-        
-    fig_traj.add_trace(go.Scatter(
-        x=x_axis, y=worst_case_y, mode='lines', 
-        line=dict(color='red', width=2, dash='dash'), 
-        name=f'Theoretical Min (-{MAX_ROUND_NET_UNITS:.0f} units/round)',
-        showlegend=True
-    ))
-    
     fig_traj.update_layout(
-        xaxis_title="Hands Played",
+        xaxis_title="Rounds Played",
         yaxis_title="Bankroll ($)",
         height=400,
         margin=dict(l=0, r=0, t=10, b=0),
@@ -313,7 +305,7 @@ with col_chart1:
 
 with col_chart2:
     st.subheader("📉 Time-to-Ruin Distribution")
-    st.markdown("Histogram showing how many hands it takes to go broke (for those who do).")
+    st.markdown("Rounds until the balance falls below the full flat bet, for stopped players only. Remaining cash can be positive.")
     
     ttl_ruin_hands = result.ttl_hands[result.ruined]
     
@@ -332,7 +324,7 @@ with col_chart2:
         )
         st.plotly_chart(fig_hist, use_container_width=True)
     else:
-        st.info("Nobody went broke! Try increasing simulations or decreasing starting bankroll.")
+        st.info("No players fell below the full flat bet during the simulated session.")
 
 st.divider()
 
@@ -375,7 +367,7 @@ with col_chart4:
     
     ruin_data = []
     for hours in [1, 2, 4, 8, 12, 24, 48]:
-        hand_target = int(round(hours * hands_per_hour))
+        hand_target = int(hours * hands_per_hour)
         if hand_target <= 0 or hand_target > params.max_hands: 
             continue
         
@@ -396,7 +388,7 @@ with col_chart4:
             column_config={
                 "Probability of Ruin": st.column_config.TextColumn(
                     "Probability of Ruin",
-                    help="Chance your bankroll is empty before this time is up."
+                    help="Chance your bankroll falls below the full flat bet by this time."
                 )
             }
         )

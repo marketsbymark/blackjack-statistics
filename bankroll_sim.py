@@ -7,7 +7,10 @@ no insurance, flat betting, common Vegas split rules.
 from __future__ import annotations
 
 import datetime as _dt
+import math
 from dataclasses import dataclass
+from decimal import Decimal
+from numbers import Integral
 
 import numpy as np
 import pandas as pd
@@ -20,6 +23,7 @@ DECKS = 6
 RESHUFFLE_AT_CARDS = 78
 MAX_SPLIT_HANDS = 4
 MAX_ROUND_NET_UNITS = MAX_SPLIT_HANDS * 2.0
+TABLE_MINIMUM = 25.0
 
 
 @dataclass
@@ -32,6 +36,27 @@ class SimParams:
     seed: int
     sims_per_batch: int = 2000
     n_trajectories: int = 50
+
+    def validate(self) -> None:
+        for name in ("bet", "bankroll", "minutes_per_hand"):
+            value = getattr(self, name)
+            if not math.isfinite(value):
+                raise ValueError(f"{name} must be finite")
+        if self.bet < TABLE_MINIMUM:
+            raise ValueError(f"bet must be at least the ${TABLE_MINIMUM:.0f} table minimum")
+        if self.bankroll < 0 or self.minutes_per_hand <= 0:
+            raise ValueError("bankroll must be nonnegative and minutes_per_hand positive")
+        for name in ("bet", "bankroll"):
+            cents = Decimal(str(getattr(self, name))) * 100
+            if cents != cents.to_integral_value():
+                raise ValueError(f"{name} must be in whole cents")
+            if name == "bet" and int(cents) % 2:
+                raise ValueError("bet must be a multiple of $0.02 for exact 3:2 payouts")
+        for name in ("sims", "max_hands", "sims_per_batch", "n_trajectories", "seed"):
+            value = getattr(self, name)
+            minimum = 1 if name in ("sims", "max_hands", "sims_per_batch") else 0
+            if isinstance(value, bool) or not isinstance(value, Integral) or value < minimum:
+                raise ValueError(f"{name} must be an integer >= {minimum}")
 
 
 @dataclass
@@ -159,12 +184,14 @@ def _hard_strategy(total: int, dealer_up: int, allow_double: bool) -> str:
 
 
 def _soft_strategy(total: int, dealer_up: int, allow_double: bool) -> str:
+    if total == 19 and dealer_up == 6 and allow_double:
+        return "double"
     if total >= 19:
         return "stand"
     if total == 18:
         if allow_double and 2 <= dealer_up <= 6:
             return "double"
-        return "stand" if dealer_up in (7, 8) else "hit"
+        return "stand" if 2 <= dealer_up <= 8 else "hit"
     if total == 17:
         return "double" if allow_double and 3 <= dealer_up <= 6 else "hit"
     if total in (15, 16):
@@ -224,6 +251,8 @@ def _settle_hand(hand: HandState, dealer_cards: list[int]) -> tuple[float, int, 
 
 
 def play_round(shoe: Shoe, bankroll_units: float) -> RoundResult:
+    if not math.isfinite(bankroll_units) or bankroll_units < 1.0:
+        raise ValueError("A round requires enough bankroll to fund the full base bet")
     shoe.ensure_cards()
     player = [shoe.draw()]
     dealer = [shoe.draw()]
@@ -288,6 +317,9 @@ def play_round(shoe: Shoe, bankroll_units: float) -> RoundResult:
                     committed += 1.0
                     max_exposure = max(max_exposure, committed)
                     splits += 1
+                    if split_aces:
+                        hand.stood = True
+                        break
                     continue
                 decision = _fallback_after_declined_split(hand, dealer_up, allow_double)
 
@@ -349,10 +381,11 @@ def validate_pmf() -> tuple[float, float]:
     The simulator no longer uses a fixed PMF; EV and SD are measured from the
     simulated card-level rounds.
     """
-    return 0.0, 0.0
+    raise NotImplementedError("No fixed PMF is used; obtain measured EV/SD from simulate()")
 
 
 def simulate(params: SimParams) -> SimResult:
+    params.validate()
     rng = np.random.default_rng(params.seed)
 
     ttl_hands = np.empty(params.sims, dtype=np.int64)
@@ -361,7 +394,8 @@ def simulate(params: SimParams) -> SimResult:
     round_units_all: list[float] = []
 
     n_checkpoints = 50
-    survival_hands = np.linspace(1, params.max_hands, n_checkpoints, dtype=np.int64)
+    survival_hands = np.unique(np.linspace(0, params.max_hands, n_checkpoints, dtype=np.int64))
+    n_checkpoints = len(survival_hands)
     survival_hits = np.zeros(n_checkpoints, dtype=np.int64)
 
     n_samples = min(params.n_trajectories, params.sims)
@@ -385,7 +419,11 @@ def simulate(params: SimParams) -> SimResult:
 
     for sim_idx in range(params.sims):
         shoe = Shoe(rng)
-        bankroll = float(params.bankroll)
+        # Integer cents keep the $25 boundary exact; never round a balance up
+        # to make it eligible and never reduce the flat bet to the balance.
+        bankroll_cents = int(Decimal(str(params.bankroll)) * 100)
+        bet_cents = int(Decimal(str(params.bet)) * 100)
+        bankroll = bankroll_cents / 100.0
         path = None
         if sim_idx < n_samples:
             path = sample_paths[sim_idx]
@@ -395,13 +433,16 @@ def simulate(params: SimParams) -> SimResult:
         is_ruined = False
 
         for hand_idx in range(1, params.max_hands + 1):
-            if bankroll < params.bet:
+            if bankroll_cents < bet_cents:
                 ttl = hand_idx - 1
                 is_ruined = True
+                if path is not None:
+                    path[hand_idx:] = bankroll
                 break
 
-            result = play_round(shoe, bankroll / params.bet)
-            bankroll += result.net_units * params.bet
+            result = play_round(shoe, bankroll_cents / bet_cents)
+            bankroll_cents += int(result.net_units * bet_cents)
+            bankroll = bankroll_cents / 100.0
 
             round_units_all.append(result.net_units)
             exposures.append(result.exposure_units)
@@ -423,7 +464,7 @@ def simulate(params: SimParams) -> SimResult:
             if path is not None:
                 path[hand_idx] = bankroll
 
-            if bankroll < params.bet:
+            if bankroll_cents < bet_cents:
                 ttl = hand_idx
                 is_ruined = True
                 if path is not None and hand_idx < params.max_hands:
@@ -514,12 +555,12 @@ def collect_inputs() -> SimParams:
     session_hours = prompt_float("Session length (hours)", 4.0)
     sims = prompt_int("Number of simulations", 1000)
     seed = prompt_int("Random seed", 20260424)
-    if bet <= 0 or bankroll <= 0 or minutes_per_hand <= 0 or session_hours <= 0:
-        raise ValueError("bet, bankroll, minutes_per_hand, and session_hours must be positive")
-    if bankroll < bet:
-        raise ValueError("bankroll must be at least one bet")
-    max_hands = max(1, int(round((session_hours * 60.0) / minutes_per_hand)))
-    return SimParams(
+    if not math.isfinite(session_hours) or session_hours <= 0:
+        raise ValueError("session_hours must be finite and positive")
+    if not math.isfinite(minutes_per_hand) or minutes_per_hand <= 0:
+        raise ValueError("minutes_per_hand must be finite and positive")
+    max_hands = int((session_hours * 60.0) / minutes_per_hand)
+    params = SimParams(
         bet=bet,
         bankroll=bankroll,
         minutes_per_hand=minutes_per_hand,
@@ -527,6 +568,8 @@ def collect_inputs() -> SimParams:
         max_hands=max_hands,
         seed=seed,
     )
+    params.validate()
+    return params
 
 
 def percentile_row(arr: np.ndarray, multiplier: float = 1.0) -> dict:
@@ -569,7 +612,7 @@ def print_terminal_report(params: SimParams, result: SimResult) -> None:
     print(f"  Rounds played       : {result.hands_played_total:,}")
     print(f"  E[X] (units)        : {result.ev_units:+.5f}")
     print(f"  SD[X] (units)       : {result.sd_units:.5f}")
-    print(f"  House edge          : {-result.ev_units * 100:.3f}%")
+    print(f"  Observed loss/base bet: {-result.ev_units * 100:.3f}% (sample estimate)")
     print(f"  Avg exposure        : {result.avg_exposure_units:.3f} units")
     print(f"  Max exposure        : {result.max_exposure_units:.1f} units")
     print(f"  Rounds with split   : {result.split_rate * 100:.2f}%")
@@ -583,7 +626,7 @@ def print_terminal_report(params: SimParams, result: SimResult) -> None:
 
     print()
     print("-" * 60)
-    print(" Time-to-Live (TTL)")
+    print(" Rounds played, capped at session end (survivors' ruin times unknown)")
     print("-" * 60)
     stats_hands = percentile_row(ttl_hands)
     stats_min = percentile_row(ttl_minutes)
@@ -601,8 +644,8 @@ def print_terminal_report(params: SimParams, result: SimResult) -> None:
     print(" Ruin probability by play duration")
     print("-" * 60)
     for hours in (1, 2, 4, 8):
-        hand_target = int(round(hours * hands_per_hour))
-        if hand_target <= 0:
+        hand_target = int(hours * hands_per_hour)
+        if hand_target <= 0 or hand_target > params.max_hands:
             continue
         ruined_by = np.mean(result.ruined & (ttl_hands <= hand_target))
         print(
@@ -610,6 +653,8 @@ def print_terminal_report(params: SimParams, result: SimResult) -> None:
             f"P(ruin) = {ruined_by * 100:5.2f}%"
         )
     print(f"  overall ruin rate (<= {params.max_hands:,} hands): {ruin_rate * 100:.2f}%")
+    print(f"  Stop threshold      : ${params.bet:,.2f}; table minimum ${TABLE_MINIMUM:.0f}")
+    print(f"  mean ending bankroll, all players: ${float(result.ending_bankroll.mean()):,.2f}")
 
     survivors = result.ending_bankroll[~result.ruined]
     if survivors.size:
@@ -625,6 +670,8 @@ def write_excel(params: SimParams, result: SimResult, path: str) -> None:
     inputs_df = pd.DataFrame(
         [
             ("Bet per hand ($)", params.bet),
+            ("Table minimum ($)", TABLE_MINIMUM),
+            ("Stop rule", "Stop below the full flat bet; retain the unplayable balance"),
             ("Starting bankroll ($)", params.bankroll),
             ("Minutes per hand", params.minutes_per_hand),
             ("Hands per hour", hands_per_hour),
@@ -642,7 +689,7 @@ def write_excel(params: SimParams, result: SimResult, path: str) -> None:
             ("Rounds played", result.hands_played_total),
             ("E[X] (units)", result.ev_units),
             ("SD[X] (units)", result.sd_units),
-            ("House edge", -result.ev_units),
+            ("Observed loss / base bet (sample estimate)", -result.ev_units),
             ("Average exposure (units)", result.avg_exposure_units),
             ("Max exposure (units)", result.max_exposure_units),
             ("Rounds with split", result.split_rate),
@@ -681,9 +728,9 @@ def write_excel(params: SimParams, result: SimResult, path: str) -> None:
     s_hr = stats_block(ttl_hours)
     summary_rows = []
     for key in ("mean", "p10", "p25", "median", "p75", "p90"):
-        summary_rows.append((f"TTL {key} (hands)", s_hands[key]))
-        summary_rows.append((f"TTL {key} (minutes)", s_min[key]))
-        summary_rows.append((f"TTL {key} (hours)", s_hr[key]))
+        summary_rows.append((f"Session-capped play duration {key} (rounds)", s_hands[key]))
+        summary_rows.append((f"Session-capped play duration {key} (minutes)", s_min[key]))
+        summary_rows.append((f"Session-capped play duration {key} (hours)", s_hr[key]))
     summary_rows.append(("Ruin rate", float(result.ruined.mean())))
     summary_rows.append(("Mean ending bankroll (all simulations)", float(np.mean(result.ending_bankroll))))
     summary_rows.append(
@@ -701,7 +748,9 @@ def write_excel(params: SimParams, result: SimResult, path: str) -> None:
     )
     summary_rows.append(("EV $ loss per hour", -result.ev_units * params.bet * hands_per_hour))
     for hours in (1, 2, 4, 8):
-        hand_target = int(round(hours * hands_per_hour))
+        hand_target = int(hours * hands_per_hour)
+        if hand_target <= 0 or hand_target > params.max_hands:
+            continue
         ruined_by = float(np.mean(result.ruined & (ttl_hands <= hand_target)))
         summary_rows.append((f"P(ruin) by {hours}h", ruined_by))
     summary_df = pd.DataFrame(summary_rows, columns=["Metric", "Value"])
@@ -709,7 +758,7 @@ def write_excel(params: SimParams, result: SimResult, path: str) -> None:
     max_minutes = float(ttl_minutes.max())
     n_bins = 60
     bin_edges = np.linspace(0, max(max_minutes, params.minutes_per_hand), n_bins + 1)
-    counts, _ = np.histogram(ttl_minutes, bins=bin_edges)
+    counts, _ = np.histogram(ttl_minutes[result.ruined], bins=bin_edges)
     ttl_dist_df = pd.DataFrame(
         {
             "bin_low_minutes": bin_edges[:-1],
